@@ -1,0 +1,156 @@
+// Trigger on Account Object to handle before/after events
+trigger AccountTrigger on Account (before insert, before update, after insert, after update, before delete) {
+    if (Trigger.isAfter) {
+        // Handle after update logic
+        if (Trigger.isUpdate) {
+            // Perform operations after Account is updated
+            AccountTriggerHandler.afterUpdate(
+                (Map<Id, Account>) Trigger.newMap, 
+                (Map<Id, Account>) Trigger.oldMap
+            );
+
+            // Update related Opportunity stages based on Account status changes
+            AccountTriggerHandler.updateOpportunityStage(
+                (List<Account>) Trigger.new, 
+                (Map<Id, Account>) Trigger.oldMap
+            );
+        }
+    }
+
+    if (Trigger.isBefore) {
+        // Handle before insert logic
+        if (Trigger.isInsert) {
+            // Populate shipping address fields from billing address before insertion
+            AccountTriggerHandler.beforeInsert((List<Account>) Trigger.new);
+        }
+
+        // Handle before update logic
+        if (Trigger.isUpdate) {
+            // Sync billing and shipping addresses before updating Accounts
+            AccountTriggerHandler.beforeUpdate(
+                (Map<Id, Account>) Trigger.oldMap, 
+                (Map<Id, Account>) Trigger.newMap
+            );
+        }
+
+        // Handle before delete logic
+        if (Trigger.isDelete) {
+            // Prevent deletion of Accounts with related Contacts or Opportunities
+            AccountTriggerHandler.preventAccountDeletion((List<Account>) Trigger.old);
+        }
+    }
+}
+
+// Trigger Handler Class for Account Object
+public class AccountTriggerHandler {
+
+    // Before Insert: Copy billing address to shipping address
+    public static void beforeInsert(List<Account> accountList) {
+        insertBillingAddressToShippingAddress(accountList);
+    }
+
+    // Before Update: Update shipping address if billing address changes
+    public static void beforeUpdate(Map<Id, Account> oldAccountMap, Map<Id, Account> newAccountMap) {
+        updateBillingAddressToShippingAddress(oldAccountMap, newAccountMap);
+    }
+
+    // After Update: Update Contacts' mailing city if billing city changes
+    public static void afterUpdate(Map<Id, Account> newAccountMap, Map<Id, Account> oldAccountMap) {
+        updateContactMailingCity(newAccountMap, oldAccountMap);
+    }
+
+    // Helper Method: Populate shipping address fields from billing address
+    public static void insertBillingAddressToShippingAddress(List<Account> accountList) {
+        for (Account acc : accountList) {
+            acc.ShippingStreet = acc.BillingStreet;
+            acc.ShippingCity = acc.BillingCity;
+            acc.ShippingPostalCode = acc.BillingPostalCode;
+            acc.ShippingState = acc.BillingState;
+            acc.ShippingCountry = acc.BillingCountry;
+        }
+    }
+
+    // Helper Method: Sync shipping address with billing address when billing address changes
+    public static void updateBillingAddressToShippingAddress(Map<Id, Account> oldAccountMap, Map<Id, Account> newAccountMap) {
+        for (Id accId : oldAccountMap.keySet()) {
+            Account oldAccount = oldAccountMap.get(accId);
+            Account newAccount = newAccountMap.get(accId);
+            updateAddressFields(newAccount, oldAccount);
+        }
+    }
+
+    // Update individual address fields if necessary
+    private static void updateAddressFields(Account newAccount, Account oldAccount) {
+        String[] billingFields = new String[] { 'BillingStreet', 'BillingCity', 'BillingPostalCode', 'BillingState', 'BillingCountry' };
+        String[] shippingFields = new String[] { 'ShippingStreet', 'ShippingCity', 'ShippingPostalCode', 'ShippingState', 'ShippingCountry' };
+
+        for (Integer i = 0; i < billingFields.size(); i++) {
+            String newBillingValue = (String) newAccount.get(billingFields[i]);
+            String oldBillingValue = (String) oldAccount.get(billingFields[i]);
+            String shippingValue = (String) newAccount.get(shippingFields[i]);
+
+            if (String.isNotBlank(newBillingValue) && !newBillingValue.equalsIgnoreCase(oldBillingValue) && !shippingValue.equalsIgnoreCase(newBillingValue)) {
+                newAccount.put(shippingFields[i], newBillingValue);
+            }
+        }
+    }
+
+    // Update Contacts' mailing city when Account's billing city changes
+    public static void updateContactMailingCity(Map<Id, Account> newAccountMap, Map<Id, Account> oldAccountMap) {
+        Map<Id, String> accCityMap = new Map<Id, String>();
+        for (Id accId : newAccountMap.keySet()) {
+            Account oldAccount = oldAccountMap.get(accId);
+            Account newAccount = newAccountMap.get(accId);
+            if (String.isNotBlank(newAccount.BillingCity) && !newAccount.BillingCity.equalsIgnoreCase(oldAccount.BillingCity)) {
+                accCityMap.put(newAccount.Id, newAccount.BillingCity);
+            }
+        }
+        List<Contact> contacts = [SELECT Id, MailingCity, AccountId FROM Contact WHERE AccountId IN :accCityMap.keySet()];
+        for (Contact contact : contacts) {
+            contact.MailingCity = accCityMap.get(contact.AccountId);
+        }
+        if (!contacts.isEmpty()) {
+            update contacts;
+        }
+    }
+
+    // Update Opportunity stages when Account's status changes to 'Closed'
+    public static void updateOpportunityStage(List<Account> newAccounts, Map<Id, Account> oldAccountMap) {
+        Set<Id> accountIds = new Set<Id>();
+        for (Account acc : newAccounts) {
+            if (acc.Status__c.equals('Closed') && !acc.Status__c.equals(oldAccountMap.get(acc.Id).Status__c)) {
+                accountIds.add(acc.Id);
+            }
+        }
+
+        if (accountIds.isEmpty()) {
+            return;
+        }
+
+        List<Opportunity> oppsToUpdate = [SELECT Id, StageName FROM Opportunity WHERE AccountId IN :accountIds];
+        for (Opportunity opp : oppsToUpdate) {
+            opp.StageName = 'Closed Won';
+        }
+
+        if (!oppsToUpdate.isEmpty()) {
+            update oppsToUpdate;
+        }
+    }
+
+    // Prevent Account deletion if it has related Contacts or Opportunities
+    public static void preventAccountDeletion(List<Account> accountList) {
+        Set<Id> accountIds = new Set<Id>();
+        for (Account acc : accountList) {
+            accountIds.add(acc.Id);
+        }
+
+        Integer contactCount = [SELECT COUNT() FROM Contact WHERE AccountId IN :accountIds];
+        Integer oppCount = [SELECT COUNT() FROM Opportunity WHERE AccountId IN :accountIds];
+
+        if (contactCount > 0 || oppCount > 0) {
+            for (Account acc : accountList) {
+                acc.addError('Account cannot be deleted because it has related Contacts or Opportunities.');
+            }
+        }
+    }
+}
