@@ -1,0 +1,90 @@
+// Trigger on Opportunity Object to handle specific business logic
+trigger OpportunityTrigger on Opportunity (after insert, after update, before update) {
+    if (Trigger.isAfter) {
+        // Handle after insert logic
+        if (Trigger.isInsert) {
+            // Automatically create a new Contact related to the Opportunity's Account
+            OpportunityTriggerHandler.createNewContact((List<Opportunity>) Trigger.new);
+        }
+
+        // Handle after update logic
+        if (Trigger.isUpdate) {
+            // Update the Account's last activity date when Opportunity stage changes to 'Closed Won'
+            OpportunityTriggerHandler.updateAccountLastActivity(
+                (List<Opportunity>) Trigger.new,
+                (Map<Id, Opportunity>) Trigger.oldMap
+            );
+        }
+    }
+
+    if (Trigger.isBefore) {
+        // Handle before update logic
+        if (Trigger.isUpdate) {
+            // Prevent stage changes for Opportunities that have passed their Close Date
+            OpportunityTriggerHandler.preventStageChange(
+                (List<Opportunity>) Trigger.new,
+                (Map<Id, Opportunity>) Trigger.oldMap
+            );
+        }
+    }
+}
+
+// Trigger Handler Class for Opportunity Object
+public class OpportunityTriggerHandler {
+
+    // After Insert: Create a default Contact for the Opportunity's Account
+    public static void createNewContact(List<Opportunity> opportunities) {
+        List<Contact> contactsToInsert = new List<Contact>();
+        for (Opportunity opp : opportunities) {
+            Contact newContact = new Contact();
+            newContact.FirstName = 'Default'; // Assign default first name
+            newContact.LastName = opp.Name + ' Contact'; // Use Opportunity name in contact's last name
+            newContact.AccountId = opp.AccountId; // Link Contact to Opportunity's Account
+            contactsToInsert.add(newContact);
+        }
+        if (!contactsToInsert.isEmpty()) {
+            insert contactsToInsert; // Insert newly created Contacts
+        }
+    }
+
+    // After Update: Update the Account's last activity date based on the latest 'Closed Won' Opportunity
+    public static void updateAccountLastActivity(List<Opportunity> opportunities, Map<Id, Opportunity> oldOppoMap) {
+        Set<Id> accountIds = new Set<Id>();
+        for (Opportunity opp : opportunities) {
+            // Check if Opportunity stage changes to 'Closed Won'
+            if (opp.StageName.equals('Closed Won') && !opp.StageName.equalsIgnoreCase(oldOppoMap.get(opp.Id).StageName)) {
+                accountIds.add(opp.AccountId); // Collect Account IDs
+            }
+        }
+
+        // Fetch related Accounts to update
+        List<Account> accountsToUpdate = [SELECT Id, Last_Activity_Date__c FROM Account WHERE Id IN :accountIds];
+
+        // Find the latest CloseDate for Opportunities in 'Closed Won' stage for each Account
+        for (Account acc : accountsToUpdate) {
+            AggregateResult latestCloseDateResult = [
+                SELECT MAX(CloseDate) maxCloseDate 
+                FROM Opportunity 
+                WHERE AccountId = :acc.Id AND StageName = 'Closed Won'
+            ];
+
+            // Update Account's Last Activity Date with the latest CloseDate
+            if (latestCloseDateResult != null && latestCloseDateResult.get('maxCloseDate') != null) {
+                acc.Last_Activity_Date__c = (Date) latestCloseDateResult.get('maxCloseDate');
+            }
+        }
+
+        // Update the Accounts with the new Last Activity Date
+        update accountsToUpdate;
+    }
+
+    // Before Update: Prevent stage changes for Opportunities with a past Close Date
+    public static void preventStageChange(List<Opportunity> newOppoList, Map<Id, Opportunity> oldOppoMap) {
+        for (Opportunity opp : newOppoList) {
+            // Block stage change if Close Date is in the past
+            if (opp.CloseDate < Date.today() && opp.StageName != oldOppoMap.get(opp.Id).StageName) {
+                opp.addError('You cannot change the Stage of this Opportunity after the Close Date.');
+            }
+        }
+    }
+}
